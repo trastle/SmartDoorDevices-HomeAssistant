@@ -11,6 +11,7 @@ import pytest
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
 from custom_components.bnd_smart_hub import sdd_client
 from custom_components.bnd_smart_hub.const import (
@@ -23,6 +24,7 @@ from custom_components.bnd_smart_hub.const import (
     DEVICE_COMMAND_STOP,
 )
 from custom_components.bnd_smart_hub.coordinator import (
+    COMMAND_CONFIRM_DELAY,
     FAST_POLL_INTERVAL,
     BnDSmartHubCoordinator,
 )
@@ -86,6 +88,37 @@ async def test_send_open_sets_optimistic_pending_command(hass, mock_entry):
         await coordinator.async_send_command("dev1", DEVICE_COMMAND_OPEN)
 
     assert coordinator.device_data("dev1")["pendingCommand"] == COMMAND_CODE_OPEN
+
+
+async def test_send_command_delays_confirmation_refresh(hass, mock_entry, freezer):
+    """Regression test: the confirmation poll must not fire immediately.
+
+    An instant poll right after sending the command almost always beats the
+    hub to reporting the new pendingCommand, which would clobber the
+    optimistic overlay with the still-stale pre-command state - briefly
+    flashing e.g. "Closed" before the real "Opening" shows up. See the
+    coordinator module docstring's "Optimistic state" note.
+    """
+    coordinator = await _coordinator(hass, mock_entry)
+    coordinator.data = {"dev1": {"pendingCommand": 0}}
+    coordinator.async_request_refresh = AsyncMock()
+
+    with patch(f"{SDD}.send_device_command", return_value={}):
+        await coordinator.async_send_command("dev1", DEVICE_COMMAND_OPEN)
+
+    coordinator.async_request_refresh.assert_not_called()
+
+    # still nothing at 9s - slower than the worst real-world stale-data lag
+    # observed (8.9s), so an instant-ish poll here would have raced the hub
+    freezer.tick(timedelta(seconds=9))
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+    coordinator.async_request_refresh.assert_not_called()
+
+    freezer.tick(COMMAND_CONFIRM_DELAY)
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+
     coordinator.async_request_refresh.assert_awaited_once()
 
 
@@ -312,3 +345,20 @@ async def test_token_refresh_soft_fails_when_no_session_key_in_response(hass, mo
         await coordinator._async_refresh_token_if_due()  # must not raise
 
     assert coordinator.session_key == original_session_key
+
+
+async def test_fast_poll_continues_until_commanded_state_reached(hass, mock_entry):
+    """Regression: pendingCommand reading 0 must not end fast polling while a
+    close command's door hasn't actually reached position 0 yet."""
+    coordinator = await _coordinator(hass, mock_entry)
+    coordinator._fast_poll_until = dt_util.utcnow() + timedelta(seconds=30)
+    coordinator._unsettled["dev1"] = DEVICE_COMMAND_CLOSE
+
+    with patch(f"{SDD}.get_devices", return_value={"data": [{"deviceId": "dev1", "pendingCommand": 0, "position": 40}]}):
+        await coordinator._async_update_data()
+    assert coordinator._fast_poll_until is not None
+
+    with patch(f"{SDD}.get_devices", return_value={"data": [{"deviceId": "dev1", "pendingCommand": 0, "position": 0}]}):
+        await coordinator._async_update_data()
+    assert coordinator._fast_poll_until is None
+    assert coordinator._unsettled == {}

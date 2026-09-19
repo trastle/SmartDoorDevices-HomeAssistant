@@ -7,7 +7,14 @@ from __future__ import annotations
 
 from datetime import time as dt_time
 
-from .const import CLOSING_COMMAND_CODES, OPENING_COMMAND_CODES
+from .const import (
+    CLOSING_COMMAND_CODES,
+    DEVICE_COMMAND_CLOSE,
+    DEVICE_COMMAND_LIGHT_OFF,
+    DEVICE_COMMAND_LIGHT_ON,
+    DEVICE_COMMAND_OPEN,
+    OPENING_COMMAND_CODES,
+)
 
 
 def is_closed(device: dict) -> bool | None:
@@ -36,6 +43,25 @@ def is_closing(device: dict) -> bool:
 
 def is_light_on(device: dict) -> bool | None:
     return device.get("lightOn")
+
+
+def command_settled(device: dict, command: str) -> bool:
+    """True once a device has reached the state a command was asking for.
+
+    pendingCommand alone isn't a reliable "still moving" signal - it can read
+    0 while the door is still travelling - so open/close/light commands are
+    judged by their actual target state. Anything else (e.g. STOP, which has
+    no target) settles once the door reports nothing mid-transition.
+    """
+    if command == DEVICE_COMMAND_OPEN:
+        return is_closed(device) is False and not is_opening(device)
+    if command == DEVICE_COMMAND_CLOSE:
+        return is_closed(device) is True and not is_closing(device)
+    if command == DEVICE_COMMAND_LIGHT_ON:
+        return is_light_on(device) is True
+    if command == DEVICE_COMMAND_LIGHT_OFF:
+        return is_light_on(device) is False
+    return not (is_opening(device) or is_closing(device))
 
 
 def parse_device_list(response: dict) -> dict[str, dict]:

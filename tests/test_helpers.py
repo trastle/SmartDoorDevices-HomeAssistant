@@ -170,3 +170,23 @@ def test_current_poll_interval_minutes_handles_wraparound_day_window():
         )
         == 15
     )
+
+
+@pytest.mark.parametrize(
+    "command,device,expected",
+    [
+        ("OPEN", _device(position=0), False),
+        ("OPEN", _device(position=50), True),
+        ("OPEN", _device(position=50, pendingCommand=2), False),
+        ("CLOSE", _device(position=50), False),
+        ("CLOSE", _device(position=0), True),
+        ("CLOSE", _device(position=0, pendingCommand=4), False),
+        ("LIGHT_ON", _device(lightOn=False), False),
+        ("LIGHT_ON", _device(lightOn=True), True),
+        ("LIGHT_OFF", _device(lightOn=False), True),
+        ("STOP", _device(pendingCommand=4), False),
+        ("STOP", _device(pendingCommand=0), True),
+    ],
+)
+def test_command_settled(command, device, expected):
+    assert helpers.command_settled(device, command) is expected
