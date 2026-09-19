@@ -19,32 +19,16 @@ be minutes away:
      entities should read through instead of self.data directly. The real
      next poll always wins - _async_update_data() drops all optimistic
      overlays as soon as fresh real data arrives, whether or not it agrees.
-     That "whether or not it agrees" is exactly why the first confirmation
-     poll is deliberately delayed by COMMAND_CONFIRM_DELAY rather than fired
-     immediately after sending the command (see the end of
-     async_send_command()): polling right away almost always beats the hub
-     to actually reporting the new pendingCommand, so an instant poll would
-     overwrite the overlay with the still-stale pre-command state - flashing
-     back to e.g. "Closed" for a moment before the real "Opening" shows up
-     on the next cycle. COMMAND_CONFIRM_DELAY isn't a guess: the two real
-     "close" commands in this hub's own history (both automation-triggered,
-     2026-09-04 and 2026-09-13 - see garage/session-notes-2026-09-18.md in
-     the home-assistant docs repo) show the optimistic "Closing" overlay
-     getting overwritten by stale data 5.3s and 8.9s later, so a 3s delay
-     (the original attempt, reusing FAST_POLL_INTERVAL) was nowhere near
-     enough. Picked with margin above the slower of those two - same kind of
-     tuned-not-guaranteed heuristic as COMMAND_COOLDOWN/FAST_POLL_DURATION
-     below, not a hard bound (sdd_client's round trips are "typically 1-2s,
-     occasionally longer" with no documented worst case).
+     That's why the first confirmation poll waits COMMAND_CONFIRM_DELAY: an
+     immediate one returns the hub's still-stale state and wipes the overlay.
+     The hub took 5-9s to catch up in its recorded history, so 12s is a tuned
+     margin, not a guaranteed bound.
   2. Fast polling - once a command is sent, _scheduled_interval() switches
      to FAST_POLL_INTERVAL for up to FAST_POLL_DURATION, instead of waiting
      out the normal day/night schedule, so the real state catches up
-     quickly. Ends early, before the full window elapses, once every commanded
-     device has reached the state its command asked for (see
-     helpers.command_settled()) and nothing is mid-transition. pendingCommand
-     alone isn't trusted as "still moving": in this hub's history it read 0
-     while the door was still closing, which cancelled fast polling early and
-     left "Closed" showing up ~3 minutes late.
+     quickly. Ends early once every commanded device has reached its target
+     state (helpers.command_settled) - pendingCommand alone can read 0 while
+     the door is still moving.
   3. Cooldown - COMMAND_COOLDOWN blocks a second command to the same device
      within 5s of the last one (guards against accidental double-taps on a
      laggy connection). STOP is deliberately exempt from being blocked by
@@ -96,9 +80,7 @@ TOKEN_REFRESH_INTERVAL = timedelta(hours=24)
 COMMAND_COOLDOWN = timedelta(seconds=5)
 FAST_POLL_INTERVAL = timedelta(seconds=3)
 FAST_POLL_DURATION = timedelta(seconds=60)
-# How long to wait before the first post-command confirmation poll - see the
-# module docstring's "Optimistic state" note for the real-world evidence
-# behind this number.
+# Delay before the first post-command confirmation poll (see module docstring).
 COMMAND_CONFIRM_DELAY = timedelta(seconds=12)
 
 # What to optimistically merge onto a device's data the instant a command is
@@ -289,10 +271,7 @@ class BnDSmartHubCoordinator(DataUpdateCoordinator[dict[str, dict]]):
             self._unsettled.pop(device_id, None)
             raise HomeAssistantError(f"Error sending {command!r} to {device_id}: {err}") from err
 
-        # Deliberately delayed, not immediate - see the module docstring's
-        # "Optimistic state" note. An instant poll here would almost always
-        # beat the hub to reporting the new pendingCommand and clobber the
-        # optimistic overlay above with the still-stale pre-command state.
+        # Delayed on purpose: an instant poll returns stale data and wipes the overlay.
         async_call_later(self.hass, COMMAND_CONFIRM_DELAY, self._async_confirm_command)
 
     async def _async_confirm_command(self, _now: datetime) -> None:
