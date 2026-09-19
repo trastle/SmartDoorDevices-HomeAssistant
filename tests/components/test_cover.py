@@ -87,7 +87,8 @@ async def test_device_info_uses_device_name_and_model(hass, mock_entry):
 
     await _setup_with_device(hass, mock_entry, name="Duncraig Garage", model="SDO9V1", firmware="1.31")
     registry = dr.async_get(hass)
-    device = registry.async_get_device_by_identifier(("bnd_smart_hub", "dev1"), mock_entry.entry_id)
+    (device,) = dr.async_entries_for_config_entry(registry, mock_entry.entry_id)
+    assert ("bnd_smart_hub", "dev1") in device.identifiers
     assert device.name == "Duncraig Garage"
     assert device.model == "SDO9V1"
     assert device.sw_version == "1.31"
