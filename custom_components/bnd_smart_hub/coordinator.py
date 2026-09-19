@@ -19,13 +19,16 @@ be minutes away:
      entities should read through instead of self.data directly. The real
      next poll always wins - _async_update_data() drops all optimistic
      overlays as soon as fresh real data arrives, whether or not it agrees.
+     That's why the first confirmation poll waits COMMAND_CONFIRM_DELAY: an
+     immediate one returns the hub's still-stale state and wipes the overlay.
+     The hub took 5-9s to catch up in its recorded history, so 12s is a tuned
+     margin, not a guaranteed bound.
   2. Fast polling - once a command is sent, _scheduled_interval() switches
      to FAST_POLL_INTERVAL for up to FAST_POLL_DURATION, instead of waiting
      out the normal day/night schedule, so the real state catches up
-     quickly. Ends early, before the full window elapses, once no device is
-     reporting mid-transition (is_opening/is_closing) - a light toggle has
-     nothing to wait on, so this typically cuts the burst down to a single
-     extra poll for that case.
+     quickly. Ends early once every commanded device has reached its target
+     state (helpers.command_settled) - pendingCommand alone can read 0 while
+     the door is still moving.
   3. Cooldown - COMMAND_COOLDOWN blocks a second command to the same device
      within 5s of the last one (guards against accidental double-taps on a
      laggy connection). STOP is deliberately exempt from being blocked by
@@ -47,6 +50,7 @@ from datetime import datetime, timedelta
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
@@ -76,6 +80,8 @@ TOKEN_REFRESH_INTERVAL = timedelta(hours=24)
 COMMAND_COOLDOWN = timedelta(seconds=5)
 FAST_POLL_INTERVAL = timedelta(seconds=3)
 FAST_POLL_DURATION = timedelta(seconds=60)
+# Delay before the first post-command confirmation poll (see module docstring).
+COMMAND_CONFIRM_DELAY = timedelta(seconds=12)
 
 # What to optimistically merge onto a device's data the instant a command is
 # sent - see the module docstring's "Optimistic state". STOP has no entry:
@@ -119,6 +125,9 @@ class BnDSmartHubCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         self._optimistic: dict[str, dict] = {}
         # device_id -> when its last command was sent, for COMMAND_COOLDOWN
         self._last_command_at: dict[str, datetime] = {}
+        # device_id -> last command still awaiting its target state; fast
+        # polling continues until every entry settles (helpers.command_settled)
+        self._unsettled: dict[str, str] = {}
 
     def device_data(self, device_id: str) -> dict:
         """Real device data with any pending optimistic overlay merged on
@@ -203,17 +212,24 @@ class BnDSmartHubCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         # overlay has either been confirmed or superseded - drop it either
         # way rather than risk it lingering past what's actually true.
         self._optimistic.clear()
-        if self._fast_poll_until is not None and not any(
-            helpers.is_opening(device) or helpers.is_closing(device) for device in data.values()
-        ):
-            # nothing left mid-transition - no reason to keep polling fast
-            # for the rest of the window
-            self._fast_poll_until = None
+        if self._fast_poll_until is not None:
+            self._unsettled = {
+                device_id: command
+                for device_id, command in self._unsettled.items()
+                if device_id in data and not helpers.command_settled(data[device_id], command)
+            }
+            if not self._unsettled and not any(
+                helpers.is_opening(device) or helpers.is_closing(device) for device in data.values()
+            ):
+                # every commanded device has reached its target and nothing is
+                # mid-transition - no reason to keep polling fast for the rest
+                # of the window
+                self._fast_poll_until = None
 
         return data
 
     async def async_send_command(self, device_id: str, command: str) -> None:
-        """Send a device command and immediately refresh state to match.
+        """Send a device command and schedule a confirmation refresh.
 
         See the module docstring for the optimistic-state/fast-poll/cooldown
         behavior this adds on top of the plain API call.
@@ -237,6 +253,7 @@ class BnDSmartHubCoordinator(DataUpdateCoordinator[dict[str, dict]]):
             self.async_update_listeners()  # instant UI feedback, ahead of the network round trip
 
         self._fast_poll_until = now + FAST_POLL_DURATION
+        self._unsettled[device_id] = command
 
         try:
             await self.hass.async_add_executor_job(
@@ -251,5 +268,11 @@ class BnDSmartHubCoordinator(DataUpdateCoordinator[dict[str, dict]]):
             )
         except sdd_client.SddError as err:
             self._optimistic.pop(device_id, None)
+            self._unsettled.pop(device_id, None)
             raise HomeAssistantError(f"Error sending {command!r} to {device_id}: {err}") from err
+
+        # Delayed on purpose: an instant poll returns stale data and wipes the overlay.
+        async_call_later(self.hass, COMMAND_CONFIRM_DELAY, self._async_confirm_command)
+
+    async def _async_confirm_command(self, _now: datetime) -> None:
         await self.async_request_refresh()
